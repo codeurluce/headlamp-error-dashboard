@@ -1,128 +1,225 @@
-import React from 'react';
+import React, { useMemo } from 'react';
 import { registerRoute, registerSidebarEntry } from '@kinvolk/headlamp-plugin/lib';
 
 import Pod from '@kinvolk/headlamp-plugin/lib/k8s/pod';
+import Event from '@kinvolk/headlamp-plugin/lib/k8s/event';
 
-import { Table, TableHead, TableRow, TableCell, TableBody, CircularProgress } from '@mui/material';
+import { CircularProgress } from '@mui/material';
 
-function ErrorDashboard() {
-  // 🔥 THIS IS THE REAL OVERVIEW WAY
-  const { items: pods, loading, error } = Pod.useList();
+function KubernetesDebugAssistant() {
+  const { items: pods, loading: podsLoading } = Pod.useList();
+  const { items: events, loading: eventsLoading } = Event.useList();
 
-  const isPodInError = (pod: any) => {
-    const phase = pod?.status?.phase;
+  const loading = podsLoading || eventsLoading;
 
-    // 🔴 IMPORTANT: Overview inclut Pending + Failed
-    if (['Failed', 'Unknown', 'Pending'].includes(phase)) return true;
+  // =========================
+  // 🔥 FIXED SCHEDULING DETECTOR
+  // =========================
 
-    // containers
-    const containers = pod?.status?.containerStatuses || [];
-
-    const containerError = containers.some((c: any) => {
-      const reason = c?.state?.waiting?.reason || c?.state?.terminated?.reason;
-
-      return [
-        'CrashLoopBackOff',
-        'ImagePullBackOff',
-        'ErrImagePull',
-        'Error',
-        'OOMKilled',
-      ].includes(reason);
-    });
-
-    // init containers (🔥 IMPORTANT)
-    const initContainers = pod?.status?.initContainerStatuses || [];
-
-    const initError = initContainers.some((c: any) => {
-      const reason = c?.state?.waiting?.reason || c?.state?.terminated?.reason;
-
-      return reason !== undefined;
-    });
-
-    return containerError || initError;
+  const isSchedulingIssue = (podEvents: any[]) => {
+    return podEvents.some((e: any) =>
+      [
+        'FailedScheduling',
+        'Insufficient cpu',
+        'Insufficient memory',
+        '0/ nodes are available',
+        'pod has unbound immediate PersistentVolumeClaims',
+      ].some(keyword => (e?.message || e?.reason || '').includes(keyword))
+    );
   };
 
-  const errorPods = (pods || []).filter(isPodInError).map((pod: any) => {
+  // =========================
+  // 🔥 INCIDENT CLASSIFIER
+  // =========================
+
+  const classifyIncident = (pod: any, podEvents: any[]) => {
+    const name = pod?.metadata?.name;
+    const namespace = pod?.metadata?.namespace;
+
     const containers = pod?.status?.containerStatuses || [];
 
-    const reason =
-      containers?.[0]?.state?.waiting?.reason ||
-      containers?.[0]?.state?.terminated?.reason ||
-      pod?.status?.phase ||
-      'Unknown';
+    const reason = containers?.[0]?.state?.waiting?.reason || pod?.status?.phase;
 
-    const restarts = containers.reduce((acc: number, c: any) => acc + (c?.restartCount || 0), 0);
+    let type = 'Unknown';
+    let severity: 'LOW' | 'MEDIUM' | 'HIGH' = 'LOW';
+    let rootCause = 'Unknown issue';
+    let suggestion = 'Check kubectl describe pod';
+
+    // =========================
+    // 🔥 IMAGE ISSUES
+    // =========================
+
+    if (reason === 'ImagePullBackOff' || reason === 'ErrImagePull') {
+      type = 'ImageIssue';
+      severity = 'HIGH';
+      rootCause = 'Container image cannot be pulled';
+      suggestion = 'Check image tag, registry credentials or image existence';
+    }
+
+    // =========================
+    // 🔥 CRASH LOOP
+    // =========================
+
+    if (reason === 'CrashLoopBackOff') {
+      type = 'CrashLoop';
+      severity = 'HIGH';
+      rootCause = 'Application is crashing repeatedly on startup';
+      suggestion = 'Check logs: kubectl logs <pod>';
+    }
+
+    // =========================
+    // 🔥 FIXED SCHEDULING (IMPORTANT CHANGE)
+    // =========================
+
+    if (isSchedulingIssue(podEvents)) {
+      type = 'Scheduling';
+      severity = 'MEDIUM';
+      rootCause = 'Pod cannot be scheduled on a node';
+      suggestion = 'Check node resources, PVCs or affinity rules';
+    }
+
+    // =========================
+    // 🔥 FAILED POD
+    // =========================
+
+    if (pod?.status?.phase === 'Failed') {
+      type = 'FailedPod';
+      severity = 'HIGH';
+      rootCause = 'Pod failed execution';
+      suggestion = 'Inspect events and container logs';
+    }
 
     return {
-      uid: pod.metadata?.uid,
-      name: pod.metadata?.name,
-      namespace: pod.metadata?.namespace,
-      reason,
-      restarts,
+      id: `${namespace}-${name}`,
+      name,
+      namespace,
+      type,
+      severity,
+      rootCause,
+      suggestion,
+      events: podEvents,
     };
-  });
+  };
+
+  // =========================
+  // 🔥 CORRELATION ENGINE
+  // =========================
+
+  const incidents = useMemo(() => {
+    if (!pods || !events) return [];
+
+    const result: any[] = [];
+
+    pods.forEach((pod: any) => {
+      const name = pod?.metadata?.name;
+      const namespace = pod?.metadata?.namespace;
+
+      const podEvents = (events || []).filter(
+        (e: any) => e?.involvedObject?.name === name && e?.involvedObject?.namespace === namespace
+      );
+
+      const containers = pod?.status?.containerStatuses || [];
+
+      const hasError =
+        pod?.status?.phase !== 'Running' || containers.some((c: any) => c?.state?.waiting?.reason);
+
+      if (!hasError) return;
+
+      result.push(classifyIncident(pod, podEvents));
+    });
+
+    return result;
+  }, [pods, events]);
+
+  // =========================
+  // 🔥 STATS
+  // =========================
+
+  const stats = useMemo(() => {
+    return {
+      high: incidents.filter(i => i.severity === 'HIGH').length,
+      medium: incidents.filter(i => i.severity === 'MEDIUM').length,
+      low: incidents.filter(i => i.severity === 'LOW').length,
+    };
+  }, [incidents]);
+
+  // =========================
+  // UI
+  // =========================
 
   if (loading) {
     return (
       <div style={{ padding: 20 }}>
-        <h1>Error Dashboard 🚀</h1>
+        <h1>Kubernetes Incident Center</h1>
         <CircularProgress />
       </div>
     );
   }
 
-  if (error) {
-    return <p style={{ color: 'red' }}>Error loading pods</p>;
-  }
-
   return (
     <div style={{ padding: 20 }}>
-      <h1>Error Dashboard 🚀</h1>
+      <h1>🧠 Kubernetes Incident Center (Phase 2 Fixed)</h1>
 
-      <Table size="small">
-        <TableHead>
-          <TableRow>
-            <TableCell>Pod</TableCell>
-            <TableCell>Namespace</TableCell>
-            <TableCell>Status</TableCell>
-            <TableCell>Restarts</TableCell>
-          </TableRow>
-        </TableHead>
+      <div style={{ marginBottom: 20 }}>
+        <p>
+          🔴 High: {stats.high} | 🟠 Medium: {stats.medium} | 🟢 Low: {stats.low}
+        </p>
+      </div>
 
-        <TableBody>
-          {errorPods.length === 0 ? (
-            <TableRow>
-              <TableCell colSpan={4} align="center">
-                ✅ Aucun pod en erreur
-              </TableCell>
-            </TableRow>
-          ) : (
-            errorPods.map((pod: any) => (
-              <TableRow key={pod.uid}>
-                <TableCell>{pod.name}</TableCell>
-                <TableCell>{pod.namespace}</TableCell>
-                <TableCell>{pod.reason}</TableCell>
-                <TableCell>{pod.restarts}</TableCell>
-              </TableRow>
-            ))
-          )}
-        </TableBody>
-      </Table>
+      {incidents.length === 0 ? (
+        <p>✅ No incidents detected</p>
+      ) : (
+        incidents.map((i: any) => (
+          <div
+            key={i.id}
+            style={{
+              padding: 12,
+              marginBottom: 12,
+              border: '1px solid #ddd',
+              borderRadius: 8,
+              background:
+                i.severity === 'HIGH' ? '#ffe5e5' : i.severity === 'MEDIUM' ? '#fff4e5' : '#f5fff5',
+            }}
+          >
+            <h3>
+              {i.severity === 'HIGH' ? '🔴' : i.severity === 'MEDIUM' ? '🟠' : '🟢'} {i.type}
+            </h3>
+
+            <p>
+              <b>Pod:</b> {i.name} ({i.namespace})
+            </p>
+
+            <p>
+              <b>Root Cause:</b> {i.rootCause}
+            </p>
+
+            <p>
+              <b>Events:</b> {i.events.length}
+            </p>
+
+            <p style={{ color: 'green' }}>💡 Fix: {i.suggestion}</p>
+          </div>
+        ))
+      )}
     </div>
   );
 }
 
+// =========================
+// REGISTER
+// =========================
+
 registerSidebarEntry({
-  name: 'error-dashboard',
-  label: 'Error Dashboard',
-  url: '/error-dashboard',
-  icon: 'mdi:alert-octagon',
+  name: 'debug-assistant',
+  label: 'Incident Center',
+  url: '/debug-assistant',
+  icon: 'mdi:bug',
 });
 
 registerRoute({
-  path: '/error-dashboard',
-  sidebar: 'error-dashboard',
-  component: ErrorDashboard,
+  path: '/debug-assistant',
+  sidebar: 'debug-assistant',
+  component: KubernetesDebugAssistant,
 });
 
-export default ErrorDashboard;
+export default KubernetesDebugAssistant;
