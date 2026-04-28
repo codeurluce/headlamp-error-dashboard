@@ -12,9 +12,9 @@ function KubernetesDebugAssistant() {
 
   const loading = podsLoading || eventsLoading;
 
-  // =========================
-  // 🔥 FIXED SCHEDULING DETECTOR
-  // =========================
+  // =====================================================
+  // 🔥 SCHEDULING DETECTOR
+  // =====================================================
 
   const isSchedulingIssue = (podEvents: any[]) => {
     return podEvents.some((e: any) =>
@@ -28,9 +28,9 @@ function KubernetesDebugAssistant() {
     );
   };
 
-  // =========================
-  // 🔥 INCIDENT CLASSIFIER
-  // =========================
+  // =====================================================
+  // 🔥 ROOT CAUSE CLASSIFIER (STRICT PRIORITY)
+  // =====================================================
 
   const classifyIncident = (pod: any, podEvents: any[]) => {
     const name = pod?.metadata?.name;
@@ -38,79 +38,90 @@ function KubernetesDebugAssistant() {
 
     const containers = pod?.status?.containerStatuses || [];
 
-    const reason = containers?.[0]?.state?.waiting?.reason || pod?.status?.phase;
+    const reason =
+      containers?.[0]?.state?.waiting?.reason ||
+      containers?.[0]?.state?.terminated?.reason ||
+      pod?.status?.phase;
 
-    let type = 'Unknown';
-    let severity: 'LOW' | 'MEDIUM' | 'HIGH' = 'LOW';
-    let rootCause = 'Unknown issue';
-    let suggestion = 'Check kubectl describe pod';
-
-    // =========================
-    // 🔥 IMAGE ISSUES
-    // =========================
+    // 🧠 PRIORITY 1 — CONTAINER ERRORS
 
     if (reason === 'ImagePullBackOff' || reason === 'ErrImagePull') {
-      type = 'ImageIssue';
-      severity = 'HIGH';
-      rootCause = 'Container image cannot be pulled';
-      suggestion = 'Check image tag, registry credentials or image existence';
+      return {
+        name,
+        namespace,
+        type: 'ImageIssue',
+        severity: 'HIGH',
+        rootCause: 'Container image cannot be pulled from registry',
+        suggestion: 'Verify image name, tag, or registry authentication',
+        events: podEvents,
+      };
     }
-
-    // =========================
-    // 🔥 CRASH LOOP
-    // =========================
 
     if (reason === 'CrashLoopBackOff') {
-      type = 'CrashLoop';
-      severity = 'HIGH';
-      rootCause = 'Application is crashing repeatedly on startup';
-      suggestion = 'Check logs: kubectl logs <pod>';
+      return {
+        name,
+        namespace,
+        type: 'CrashLoop',
+        severity: 'HIGH',
+        rootCause: 'Application is repeatedly crashing on startup',
+        suggestion: 'Check logs: kubectl logs <pod>',
+        events: podEvents,
+      };
     }
 
-    // =========================
-    // 🔥 FIXED SCHEDULING (IMPORTANT CHANGE)
-    // =========================
-
-    if (isSchedulingIssue(podEvents)) {
-      type = 'Scheduling';
-      severity = 'MEDIUM';
-      rootCause = 'Pod cannot be scheduled on a node';
-      suggestion = 'Check node resources, PVCs or affinity rules';
-    }
-
-    // =========================
-    // 🔥 FAILED POD
-    // =========================
+    // 🧠 PRIORITY 2 — POD STATE
 
     if (pod?.status?.phase === 'Failed') {
-      type = 'FailedPod';
-      severity = 'HIGH';
-      rootCause = 'Pod failed execution';
-      suggestion = 'Inspect events and container logs';
+      return {
+        name,
+        namespace,
+        type: 'FailedPod',
+        severity: 'HIGH',
+        rootCause: 'Pod execution failed',
+        suggestion: 'Inspect logs and events',
+        events: podEvents,
+      };
     }
 
-    return {
-      id: `${namespace}-${name}`,
-      name,
-      namespace,
-      type,
-      severity,
-      rootCause,
-      suggestion,
-      events: podEvents,
-    };
+    if (pod?.status?.phase === 'Pending') {
+      return {
+        name,
+        namespace,
+        type: 'PendingPod',
+        severity: 'MEDIUM',
+        rootCause: 'Pod stuck in Pending state',
+        suggestion: 'Check resources, PVC or node availability',
+        events: podEvents,
+      };
+    }
+
+    // 🧠 PRIORITY 3 — EVENTS
+
+    if (isSchedulingIssue(podEvents)) {
+      return {
+        name,
+        namespace,
+        type: 'Scheduling',
+        severity: 'MEDIUM',
+        rootCause: 'Pod cannot be scheduled on a node',
+        suggestion: 'Check node resources, affinity or PVC',
+        events: podEvents,
+      };
+    }
+
+    return null;
   };
 
-  // =========================
-  // 🔥 CORRELATION ENGINE
-  // =========================
+  // =====================================================
+  // 🔥 GROUPING ENGINE (ROOT CAUSE VIEW)
+  // =====================================================
 
-  const incidents = useMemo(() => {
+  const groupedIncidents = useMemo(() => {
     if (!pods || !events) return [];
 
-    const result: any[] = [];
+    const map = new Map<string, any>();
 
-    pods.forEach((pod: any) => {
+    for (const pod of pods) {
       const name = pod?.metadata?.name;
       const namespace = pod?.metadata?.namespace;
 
@@ -118,39 +129,56 @@ function KubernetesDebugAssistant() {
         (e: any) => e?.involvedObject?.name === name && e?.involvedObject?.namespace === namespace
       );
 
-      const containers = pod?.status?.containerStatuses || [];
+      const incident = classifyIncident(pod, podEvents);
 
-      const hasError =
-        pod?.status?.phase !== 'Running' || containers.some((c: any) => c?.state?.waiting?.reason);
+      if (!incident) continue;
 
-      if (!hasError) return;
+      const key = incident.type; // 🔥 ROOT CAUSE GROUP KEY
 
-      result.push(classifyIncident(pod, podEvents));
-    });
+      if (!map.has(key)) {
+        map.set(key, {
+          type: incident.type,
+          severity: incident.severity,
+          rootCause: incident.rootCause,
+          suggestion: incident.suggestion,
+          pods: [],
+          totalEvents: 0,
+        });
+      }
 
-    return result;
+      const group = map.get(key);
+
+      group.pods.push({
+        name: incident.name,
+        namespace: incident.namespace,
+      });
+
+      group.totalEvents += incident.events.length;
+    }
+
+    return Array.from(map.values());
   }, [pods, events]);
 
-  // =========================
-  // 🔥 STATS
-  // =========================
+  // =====================================================
+  // 🔥 STATS (BASED ON GROUPS)
+  // =====================================================
 
   const stats = useMemo(() => {
     return {
-      high: incidents.filter(i => i.severity === 'HIGH').length,
-      medium: incidents.filter(i => i.severity === 'MEDIUM').length,
-      low: incidents.filter(i => i.severity === 'LOW').length,
+      high: groupedIncidents.filter(i => i.severity === 'HIGH').length,
+      medium: groupedIncidents.filter(i => i.severity === 'MEDIUM').length,
+      low: groupedIncidents.filter(i => i.severity === 'LOW').length,
     };
-  }, [incidents]);
+  }, [groupedIncidents]);
 
-  // =========================
+  // =====================================================
   // UI
-  // =========================
+  // =====================================================
 
   if (loading) {
     return (
       <div style={{ padding: 20 }}>
-        <h1>Kubernetes Incident Center</h1>
+        <h1>🧠 Kubernetes Incident Center</h1>
         <CircularProgress />
       </div>
     );
@@ -158,46 +186,52 @@ function KubernetesDebugAssistant() {
 
   return (
     <div style={{ padding: 20 }}>
-      <h1>🧠 Kubernetes Incident Center (Phase 2 Fixed)</h1>
+      <h1>🧠 Root Cause View (PRO SRE MODE)</h1>
 
+      {/* STATS */}
       <div style={{ marginBottom: 20 }}>
-        <p>
-          🔴 High: {stats.high} | 🟠 Medium: {stats.medium} | 🟢 Low: {stats.low}
-        </p>
+        🔴 High: {stats.high} | 🟠 Medium: {stats.medium} | 🟢 Low: {stats.low}
       </div>
 
-      {incidents.length === 0 ? (
+      {/* INCIDENT GROUPS */}
+      {groupedIncidents.length === 0 ? (
         <p>✅ No incidents detected</p>
       ) : (
-        incidents.map((i: any) => (
+        groupedIncidents.map(group => (
           <div
-            key={i.id}
+            key={group.type}
             style={{
               padding: 12,
               marginBottom: 12,
               border: '1px solid #ddd',
               borderRadius: 8,
               background:
-                i.severity === 'HIGH' ? '#ffe5e5' : i.severity === 'MEDIUM' ? '#fff4e5' : '#f5fff5',
+                group.severity === 'HIGH'
+                  ? '#ffe5e5'
+                  : group.severity === 'MEDIUM'
+                  ? '#fff4e5'
+                  : '#f5fff5',
             }}
           >
             <h3>
-              {i.severity === 'HIGH' ? '🔴' : i.severity === 'MEDIUM' ? '🟠' : '🟢'} {i.type}
+              {group.severity === 'HIGH' ? '🔴' : group.severity === 'MEDIUM' ? '🟠' : '🟢'}{' '}
+              {group.type}
             </h3>
 
             <p>
-              <b>Pod:</b> {i.name} ({i.namespace})
+              <b>Pods impactés:</b>{' '}
+              {group.pods.map((p: any) => `${p.name} (${p.namespace})`).join(', ')}
             </p>
 
             <p>
-              <b>Root Cause:</b> {i.rootCause}
+              <b>Root Cause:</b> {group.rootCause}
             </p>
 
             <p>
-              <b>Events:</b> {i.events.length}
+              <b>Total Events:</b> {group.totalEvents}
             </p>
 
-            <p style={{ color: 'green' }}>💡 Fix: {i.suggestion}</p>
+            <p style={{ color: 'green' }}>💡 Fix: {group.suggestion}</p>
           </div>
         ))
       )}
@@ -205,9 +239,9 @@ function KubernetesDebugAssistant() {
   );
 }
 
-// =========================
+// =====================================================
 // REGISTER
-// =========================
+// =====================================================
 
 registerSidebarEntry({
   name: 'debug-assistant',
