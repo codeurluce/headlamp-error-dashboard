@@ -1,71 +1,85 @@
-import React, { useEffect, useState } from 'react';
-import { registerRoute, registerSidebarEntry, K8s } from '@kinvolk/headlamp-plugin/lib';
+import React from 'react';
+import { registerRoute, registerSidebarEntry } from '@kinvolk/headlamp-plugin/lib';
 
-import { Table, TableHead, TableRow, TableCell, TableBody } from '@mui/material';
+import Pod from '@kinvolk/headlamp-plugin/lib/k8s/pod';
+
+import { Table, TableHead, TableRow, TableCell, TableBody, CircularProgress } from '@mui/material';
 
 function ErrorDashboard() {
-  const [pods, setPods] = useState<any[]>([]);
+  // 🔥 THIS IS THE REAL OVERVIEW WAY
+  const { items: pods, loading, error } = Pod.useList();
 
-  const loadPods = async () => {
-    try {
-      const Pod = K8s.cluster().makeKubeObject('pods');
-      const list = await Pod.list();
-      setPods(list.items || []);
-    } catch (err) {
-      console.error('Error loading pods:', err);
-    }
+  const isPodInError = (pod: any) => {
+    const phase = pod?.status?.phase;
+
+    // 🔴 IMPORTANT: Overview inclut Pending + Failed
+    if (['Failed', 'Unknown', 'Pending'].includes(phase)) return true;
+
+    // containers
+    const containers = pod?.status?.containerStatuses || [];
+
+    const containerError = containers.some((c: any) => {
+      const reason = c?.state?.waiting?.reason || c?.state?.terminated?.reason;
+
+      return [
+        'CrashLoopBackOff',
+        'ImagePullBackOff',
+        'ErrImagePull',
+        'Error',
+        'OOMKilled',
+      ].includes(reason);
+    });
+
+    // init containers (🔥 IMPORTANT)
+    const initContainers = pod?.status?.initContainerStatuses || [];
+
+    const initError = initContainers.some((c: any) => {
+      const reason = c?.state?.waiting?.reason || c?.state?.terminated?.reason;
+
+      return reason !== undefined;
+    });
+
+    return containerError || initError;
   };
 
-  useEffect(() => {
-    loadPods();
+  const errorPods = (pods || []).filter(isPodInError).map((pod: any) => {
+    const containers = pod?.status?.containerStatuses || [];
 
-    // refresh auto (important pour un dashboard)
-    const interval = setInterval(loadPods, 5000);
-    return () => clearInterval(interval);
-  }, []);
+    const reason =
+      containers?.[0]?.state?.waiting?.reason ||
+      containers?.[0]?.state?.terminated?.reason ||
+      pod?.status?.phase ||
+      'Unknown';
 
-  // 🔴 détection robuste des erreurs container
-  const isContainerInError = (c: any) => {
-    const state = c?.state;
+    const restarts = containers.reduce((acc: number, c: any) => acc + (c?.restartCount || 0), 0);
 
-    const reason = state?.waiting?.reason || state?.terminated?.reason || state?.running?.reason;
-
-    const errorReasons = [
-      'CrashLoopBackOff',
-      'ImagePullBackOff',
-      'ErrImagePull',
-      'Error',
-      'OOMKilled',
-    ];
-
-    return errorReasons.includes(reason);
-  };
-
-  // 🔴 filtre pods en erreur (multi-containers safe)
-  const errorPods = pods.filter((pod: any) => {
-    const containers = pod.status?.containerStatuses || [];
-    return containers.some(isContainerInError);
+    return {
+      uid: pod.metadata?.uid,
+      name: pod.metadata?.name,
+      namespace: pod.metadata?.namespace,
+      reason,
+      restarts,
+    };
   });
+
+  if (loading) {
+    return (
+      <div style={{ padding: 20 }}>
+        <h1>Error Dashboard 🚀</h1>
+        <CircularProgress />
+      </div>
+    );
+  }
+
+  if (error) {
+    return <p style={{ color: 'red' }}>Error loading pods</p>;
+  }
 
   return (
     <div style={{ padding: 20 }}>
-      <h1>Error Dashboard</h1>
+      <h1>Error Dashboard 🚀</h1>
 
-      <Table
-        size="small"
-        sx={theme => ({
-          '& .MuiTableHead-root': {
-            backgroundColor: theme.palette.background.default,
-          },
-          '& .MuiTableCell-head': {
-            fontWeight: 600,
-            color: theme.palette.text.secondary,
-          },
-          '& .MuiTableRow-root:hover': {
-            backgroundColor: theme.palette.action.hover,
-          },
-        })}
-      >
+      <Table size="small">
         <TableHead>
           <TableRow>
             <TableCell>Pod</TableCell>
@@ -79,33 +93,18 @@ function ErrorDashboard() {
           {errorPods.length === 0 ? (
             <TableRow>
               <TableCell colSpan={4} align="center">
-                No error pods detected
+                ✅ Aucun pod en erreur
               </TableCell>
             </TableRow>
           ) : (
-            errorPods.map((pod: any) => {
-              const containers = pod.status?.containerStatuses || [];
-
-              // prend le premier container en erreur (si plusieurs)
-              const failingContainer = containers.find(isContainerInError);
-
-              const state = failingContainer?.state;
-              const reason = state?.waiting?.reason || state?.terminated?.reason || 'Unknown';
-
-              const restartCount = containers.reduce(
-                (acc: number, c: any) => acc + (c?.restartCount || 0),
-                0
-              );
-
-              return (
-                <TableRow key={pod.metadata.uid}>
-                  <TableCell>{pod.metadata.name}</TableCell>
-                  <TableCell>{pod.metadata.namespace}</TableCell>
-                  <TableCell>{reason}</TableCell>
-                  <TableCell>{restartCount}</TableCell>
-                </TableRow>
-              );
-            })
+            errorPods.map((pod: any) => (
+              <TableRow key={pod.uid}>
+                <TableCell>{pod.name}</TableCell>
+                <TableCell>{pod.namespace}</TableCell>
+                <TableCell>{pod.reason}</TableCell>
+                <TableCell>{pod.restarts}</TableCell>
+              </TableRow>
+            ))
           )}
         </TableBody>
       </Table>
